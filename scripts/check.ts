@@ -53,6 +53,7 @@ import {
   sanitizeIssueExceptions,
 } from '../src/lib/exception';
 import { findReferencePath } from '../src/lib/pathfind';
+import { boundaryOffset, linearText, type SeqNodeAdapter } from '../src/lib/selection';
 let pass = 0;
 let fail = 0;
 function check(name: string, cond: boolean, extra = '') {
@@ -559,6 +560,102 @@ check('同序号歧义', ambA.issues.some((i) => i.type === 'ambiguous'), JSON.s
   check('合法批注保留', cleaned.length === 2 && cleaned[0].status === 'review');
   check('缺省 id / 时间戳自动补全', Boolean(cleaned[1].id) && typeof cleaned[1].createdAt === 'number');
   check('非法状态回退 anchored', sanitizeAnnotations([{ nodeId: 'n', quote: 'a', content: 'c', status: 'weird' }])[0].status === 'anchored');
+}
+
+// ---- 审阅批注：选区边界 → 原正文字符偏移（嵌套 mark / 引用 chip 边界） ----
+{
+  // 构造与 HighlightedText 渲染同构的简化 DOM：
+  //   文本「甲」<ann><term>按照</term></ann> 文本「乙」<chip>第五条第二款</chip> 文本「丙」
+  // 线性正文：甲按照乙第五条第二款丙（偏移：甲0、按照[1,3)、乙3、chip[4,10)、丙[10,11)）
+  interface FakeNode {
+    t?: string;
+    c?: FakeNode[];
+    parent?: FakeNode | null;
+  }
+  const tx = (s: string): FakeNode => ({ t: s, parent: null });
+  const el = (...children: FakeNode[]): FakeNode => {
+    const n: FakeNode = { c: children, parent: null };
+    for (const ch of children) ch.parent = n;
+    return n;
+  };
+  const term = el(tx('按照'));
+  const ann = el(term);
+  const chipText = tx('第五条第二款');
+  const chip = el(chipText);
+  const outside = el(tx('外部'));
+  const container = el(tx('甲'), ann, tx('乙'), chip, tx('丙'));
+
+  const fakeAdapter: SeqNodeAdapter<FakeNode> = {
+    isText: (n) => n.t !== undefined,
+    isSame: (a, b) => a === b,
+    contains: (root, n) => {
+      let cur: FakeNode | null | undefined = n;
+      while (cur) {
+        if (cur === root) return true;
+        cur = cur.parent;
+      }
+      return false;
+    },
+    textOf: (n) => n.t ?? '',
+    textLength: (n) => n.t?.length ?? 0,
+    parent: (n) => n.parent ?? null,
+    childCount: (n) => n.c?.length ?? 0,
+    childAt: (n, i) => n.c![i],
+  };
+
+  check('选区线性文本等于原正文', linearText(fakeAdapter, container) === '甲按照乙第五条第二款丙', linearText(fakeAdapter, container));
+  check('容器外边界返回 null', boundaryOffset(fakeAdapter, container, outside, 0) === null);
+  check('文本节点内部偏移：甲[0,1)', boundaryOffset(fakeAdapter, container, container.c![0], 1) === 1);
+  check('mark 内文本起点偏移为 1', boundaryOffset(fakeAdapter, container, term.c![0], 0) === 1);
+  check('mark 内文本中部偏移为 2', boundaryOffset(fakeAdapter, container, term.c![0], 1) === 2);
+  // 关键回归：端点落在嵌套元素边界（term 之后）应为 3，旧实现忽略元素 offset
+  check('嵌套元素后边界：term offset 1 → 3', boundaryOffset(fakeAdapter, container, term, 1) === 3, String(boundaryOffset(fakeAdapter, container, term, 1)));
+  check('嵌套元素前边界：term offset 0 → 1', boundaryOffset(fakeAdapter, container, term, 0) === 1);
+  check('ann 边界：offset 0/1 → 1/3', boundaryOffset(fakeAdapter, container, ann, 0) === 1 && boundaryOffset(fakeAdapter, container, ann, 1) === 3);
+  check('引用 chip 前边界 → 4', boundaryOffset(fakeAdapter, container, chip, 0) === 4);
+  check('引用 chip 后边界 → 10', boundaryOffset(fakeAdapter, container, chip, 1) === 10);
+  check('chip 内文本偏移：+3 → 7', boundaryOffset(fakeAdapter, container, chipText, 3) === 7);
+  check('chip 内文本末尾 → 10', boundaryOffset(fakeAdapter, container, chipText, 6) === 10);
+  check('容器边界：第 3 个子节点前（chip 前）→ 4', boundaryOffset(fakeAdapter, container, container, 3) === 4);
+  check('容器边界：第 4 个子节点前（丙前）→ 10', boundaryOffset(fakeAdapter, container, container, 4) === 10);
+  check('元素 offset 越界钳制到末尾', boundaryOffset(fakeAdapter, container, chip, 9) === 10);
+  check('文本 offset 越界钳制到节点末', boundaryOffset(fakeAdapter, container, chipText, 99) === 10);
+  check('负数 offset 钳制到 0', boundaryOffset(fakeAdapter, container, term, -3) === 1);
+
+  // 跨「普通文本 + 规范用语 mark + 引用 chip」选区：chip 后边界(10) 到 mark 内文本起(1)
+  const selStart = boundaryOffset(fakeAdapter, container, term.c![0], 0);
+  const selEnd = boundaryOffset(fakeAdapter, container, chip, 1);
+  const full = linearText(fakeAdapter, container);
+  check(
+    '跨 mark/chip 选区引文按原文序列拼接',
+    selStart === 1 && selEnd === 10 && full.slice(selStart!, selEnd!) === '按照乙第五条第二款',
+    full.slice(selStart ?? 0, selEnd ?? 0),
+  );
+}
+
+// ---- 审阅批注：Store 拒绝空 / 越界 / 跨节点无效区间写入 ----
+{
+  const d = parseDocument(`批注法
+
+第一条
+为了规范批注活动，制定本办法。
+
+第二条
+另一段正文。`).doc;
+  renumberAll(d.root);
+  const n1 = d.root[0].children[0];
+  const n2 = d.root[1].children[0];
+  const store = new AppStore({ doc: d, confirmed: {}, annotations: [] });
+  const len = n1.text.length;
+  check('Store：空选区不创建批注', store.addAnnotation(n1.id, 3, 3, 'x') === null);
+  check('Store：负偏移不创建批注', store.addAnnotation(n1.id, -2, 3, 'x') === null);
+  check('Store：越界区间不创建批注', store.addAnnotation(n1.id, 0, len + 1, 'x') === null);
+  check('Store：零长度区间不创建批注', store.addAnnotation(n1.id, 5, 5, 'x') === null);
+  check('Store：不存在节点不创建批注', store.addAnnotation('no-such-node', 0, 2, 'x') === null);
+  check('Store：起止颠倒自动归一化仍可创建', typeof store.addAnnotation(n1.id, 4, 0, 'ok2') === 'string');
+  const id = store.addAnnotation(n1.id, 0, 4, 'ok');
+  check('Store：合法区间创建成功', typeof id === 'string' && store.getSnapshot().annotations.length === 2, String(id));
+  void n2;
 }
 
 // ---- 审阅批注：快照携带批注并只读 ----

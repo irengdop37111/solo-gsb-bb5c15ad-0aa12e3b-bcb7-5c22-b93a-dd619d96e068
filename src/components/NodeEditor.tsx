@@ -7,51 +7,22 @@ import type {
 } from '../../shared/model';
 import { useApp, ANN_FOCUS_EVENT, TERM_FOCUS_EVENT } from '../lib/context';
 import { useHighlighter } from '../lib/highlighter';
+import {
+  boundaryOffset,
+  domSeqAdapter,
+  linearText,
+  useSelectionGesture,
+} from '../lib/selection';
 import { RefInline } from './RefInline';
 
 interface PendingSelection {
   start: number;
   end: number;
+  /** 捕获选区时的引文（按原正文字符序列）；提交前据此确认选区仍有效 */
+  quote: string;
   /** 浮层屏幕坐标（相对视口） */
   x: number;
   y: number;
-}
-
-/** 把 DOM Selection 的边界转换为容器内按渲染文本（含引用 chip 原文）计算的字符偏移 */
-function textOffsetBefore(container: HTMLElement, target: Node): number {
-  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-  let total = 0;
-  let cur = walker.nextNode();
-  while (cur && cur !== target) {
-    total += cur.textContent?.length ?? 0;
-    cur = walker.nextNode();
-  }
-  return total;
-}
-
-function domOffset(container: HTMLElement, node: Node, offset: number): number | null {
-  if (!container.contains(node)) return null;
-  if (node.nodeType === Node.TEXT_NODE) {
-    return textOffsetBefore(container, node) + offset;
-  }
-  if (node === container) {
-    // 容器边界：offset 为子节点序——累加前 offset 个子节点包含的文本
-    let acc = 0;
-    for (let i = 0; i < offset && i < node.childNodes.length; i++) {
-      acc += node.childNodes[i].textContent?.length ?? 0;
-    }
-    return acc;
-  }
-  // 边界落在内部元素（如 mark/button）之前：累加其前序全部文本
-  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-  let acc = 0;
-  let cur = walker.nextNode();
-  while (cur) {
-    if (node.contains(cur)) break;
-    acc += cur.textContent?.length ?? 0;
-    cur = walker.nextNode();
-  }
-  return acc;
 }
 
 export function NodeEditor({
@@ -70,6 +41,7 @@ export function NodeEditor({
   const hl = useHighlighter(highlighter);
   const bodyRef = useRef<HTMLDivElement>(null);
   const renderedRef = useRef<HTMLDivElement>(null);
+  const gesture = useSelectionGesture();
 
   useEffect(() => {
     if (!editing) setDraft(node.text);
@@ -93,18 +65,47 @@ export function NodeEditor({
   const captureSelection = () => {
     const sel = window.getSelection();
     const container = renderedRef.current;
-    if (!sel || sel.rangeCount === 0 || !container || !sel.toString()) {
+    if (!sel || sel.rangeCount === 0 || !container || sel.isCollapsed || !sel.toString()) {
       setPending(null);
       return;
     }
     const range = sel.getRangeAt(0);
-    if (!container.contains(range.startContainer) || !container.contains(range.endContainer)) {
+    // 仅接受两端都落在同一节点渲染容器内的选区：跨节点选区不写批注
+    if (
+      !container.contains(range.startContainer) ||
+      !container.contains(range.endContainer)
+    ) {
       setPending(null);
       return;
     }
-    const start = domOffset(container, range.startContainer, range.startOffset);
-    const end = domOffset(container, range.endContainer, range.endOffset);
-    if (start === null || end === null || end <= start || end > node.text.length) {
+    // 容器内文本按文档序拼接必须等于当前正文，否则渲染结构异常时不使用偏移
+    if (linearText(domSeqAdapter, container) !== node.text) {
+      setPending(null);
+      return;
+    }
+    const s = boundaryOffset(
+      domSeqAdapter,
+      container,
+      range.startContainer,
+      range.startOffset,
+    );
+    const e = boundaryOffset(
+      domSeqAdapter,
+      container,
+      range.endContainer,
+      range.endOffset,
+    );
+    const start = s === null || e === null ? null : Math.min(s, e);
+    const end = s === null || e === null ? null : Math.max(s, e);
+    // 空选区、越界选区或引文与实际选中文字不符（正文已变化等）一律不弹浮层
+    if (
+      start === null ||
+      end === null ||
+      end <= start ||
+      start < 0 ||
+      end > node.text.length ||
+      node.text.slice(start, end) !== sel.toString()
+    ) {
       setPending(null);
       return;
     }
@@ -112,6 +113,7 @@ export function NodeEditor({
     setPending({
       start,
       end,
+      quote: node.text.slice(start, end),
       x: Math.max(8, Math.min(rect.left + rect.width / 2 - 90, window.innerWidth - 200)),
       y: rect.top - 46,
     });
@@ -158,12 +160,19 @@ export function NodeEditor({
         <div
           ref={renderedRef}
           className="rendered-text"
+          onMouseDown={gesture.onMouseDown}
           onMouseUp={(e) => {
             // 在批注浮层内松开鼠标时不重新捕获（避免提交/取消时浮层闪动）
             if ((e.target as HTMLElement).closest('.ann-pop')) return;
             captureSelection();
           }}
           onClick={(e) => {
+            // 拖选 / 双击选词收尾触发的 click 不进入编辑态、不触发标记跳转，
+            // 保持批注浮层；单击未选中文本（选区手势前后无变化）仍按原行为编辑正文
+            if (gesture.isTailClick(e)) {
+              e.stopPropagation();
+              return;
+            }
             const annEl = (e.target as HTMLElement).closest('.ann-mark') as HTMLElement | null;
             if (annEl) {
               const id = annEl.dataset.annId;
@@ -212,9 +221,20 @@ export function NodeEditor({
         <SelectionPopover
           key={`${pending.start}-${pending.end}`}
           pending={pending}
-          quote={node.text.slice(pending.start, pending.end)}
+          quote={pending.quote}
           onClose={() => setPending(null)}
           onSubmit={(content) => {
+            // 提交前再次核对：正文变化导致区间或引文失效（跨节点/空/越界）时不写入批注
+            if (
+              pending.end <= pending.start ||
+              pending.start < 0 ||
+              pending.end > node.text.length ||
+              node.text.slice(pending.start, pending.end) !== pending.quote
+            ) {
+              setPending(null);
+              window.getSelection()?.removeAllRanges();
+              return;
+            }
             const id = store.addAnnotation(node.id, pending.start, pending.end, content);
             setPending(null);
             window.getSelection()?.removeAllRanges();

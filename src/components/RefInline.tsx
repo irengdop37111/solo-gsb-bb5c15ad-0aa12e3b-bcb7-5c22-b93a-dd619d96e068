@@ -1,5 +1,6 @@
 import { useApp } from '../lib/context';
 import { useHighlighter } from '../lib/highlighter';
+import { useSelectionGesture } from '../lib/selection';
 import type { RefOccurrence } from '../../shared/model';
 
 const STATUS_TITLE: Record<string, string> = {
@@ -23,6 +24,8 @@ export function RefInline({
   const hl = useHighlighter(highlighter);
   const { resolution, span } = occurrence;
   const { analysis } = store.getSnapshot();
+  /** 识别拖选 / 双击选词收尾落在 chip 上的 click，避免误跳转、误关浮层 */
+  const gesture = useSelectionGesture();
 
   const isCombined = span.kind === 'articleList' || span.kind === 'articleRange';
   const targetIds =
@@ -77,8 +80,12 @@ export function RefInline({
       onMouseLeave={() => highlighter.hoverRef(null, null)}
       onFocus={() => highlighter.hoverRef(occurrence.key, targetIds)}
       onBlur={() => highlighter.hoverRef(null, null)}
+      onMouseDown={gesture.onMouseDown}
       onClick={(e) => {
         e.stopPropagation();
+        // 拖选 / 双击选词收尾落在 chip 上时不跳转，保持批注浮层；
+        // 普通单击（未产生选区）仍按原行为跳转到引用目标
+        if (gesture.isTailClick(e)) return;
         if (targetId && resolution.status === 'ok') {
           highlighter.jumpTo(targetId);
         }
